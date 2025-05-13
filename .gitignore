@@ -1,0 +1,3 @@
+ckpt/
+!ckpt/.gitkeeper
+!depth_anywhere_ros2/baseline_models/HoHoNet/lib/
