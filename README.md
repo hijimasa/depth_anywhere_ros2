@@ -49,20 +49,18 @@ This package is based on the [Depth-Anywhere](https://github.com/albert100121/De
 ### Launch the node
 
 ```bash
-ros2 run depth_anywhere_ros2 infer --ros-args -p model_name:=UniFuse -p image_topic:=/image_topic -p points_topic:=/points -p device:=cuda
+ros2 run depth_anywhere_ros2 infer --ros-args -r image:=/image_topic -r points:=/points -p model_name:=UniFuse -p device:=cuda
 ```
 
 ### Parameters
 
-- `image_topic`: Input RGB image topic (default: `image`)
-- `points_topic`: Output Pointcloud topic (default: `points`)
-- `model_name`: Depth-Anywhere model variant to use
+- `model_name`: Depth-Anywhere model variant to use (`UniFuse`, `BiFuseV2`, `HoHoNet`, ``)
 - `device`: Whether to use acceleration device (default: `cuda`)
 
 ### Topics
 
-- **Subscribed**: RGB image (`sensor_msgs/Image`)
-- **Published**: PointCloud (`sensor_msgs/PointCloud2`)
+- **Subscribed**: image (`sensor_msgs/Image`)
+- **Published**: points (`sensor_msgs/PointCloud2`)
 
 ## License
 
