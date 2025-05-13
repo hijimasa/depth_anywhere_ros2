@@ -79,18 +79,13 @@ class DepthAnywherePCL(Node):
         super().__init__('depth_anywhere_pcl')
 
         # --- ROS パラメータ ---
-        self.declare_parameter('model_name',       'HoHoNet')
-        self.declare_parameter('weight_path',      '/path/to/checkpoint.pth')
-        self.declare_parameter('image_topic',      'image')
-        self.declare_parameter('points_topic',     'points')
+        self.declare_parameter('model_name',       'UniFuse')
         self.declare_parameter('equi_h',           512)
         self.declare_parameter('equi_w',           1024)
         self.declare_parameter('device',           'cuda')
         self.declare_parameter('scale_factor',       2.0)
 
         self.model_name   = self.get_parameter('model_name').get_parameter_value().string_value
-        image_topic  = self.get_parameter('image_topic').get_parameter_value().string_value
-        points_topic = self.get_parameter('points_topic').get_parameter_value().string_value
         H            = self.get_parameter('equi_h').get_parameter_value().integer_value
         W            = self.get_parameter('equi_w').get_parameter_value().integer_value
         device       = self.get_parameter('device').get_parameter_value().string_value
@@ -107,8 +102,8 @@ class DepthAnywherePCL(Node):
 
         # CvBridge & subscriber/publisher
         self.br  = CvBridge()
-        self.sub = self.create_subscription(Image, image_topic, self.cb_image, 1)
-        self.pub = self.create_publisher(PointCloud2, points_topic, 1)
+        self.sub = self.create_subscription(Image, "image", self.cb_image, 1)
+        self.pub = self.create_publisher(PointCloud2, "points", 1)
 
         # equirectangular→方向ベクトルマップを事前生成
         self.H = H; self.W = W
