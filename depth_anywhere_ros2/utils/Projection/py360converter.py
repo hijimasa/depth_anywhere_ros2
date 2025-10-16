@@ -82,16 +82,24 @@ class Equirec2Cube:
 
         h, w = equ_img.shape[:2]
         if h != self.equ_h or w != self.equ_w:
-            equ_img = cv2.resize(equ_img, (self.equ_w, self.equ_h))
+            equ_img = cv2.resize(equ_img, (self.equ_w, self.equ_h), interpolation=cv2.INTER_LINEAR)
             if equ_dep is not None:
                 equ_dep = cv2.resize(equ_dep, (self.equ_w, self.equ_h), interpolation=cv2.INTER_NEAREST)
 
-        cube_img = np.stack([self.sample_equirec(equ_img[..., i], order=1)
-                             for i in range(equ_img.shape[2])], axis=-1)
+        # Optimized: Use cv2.remap instead of map_coordinates for all channels at once
+        # cv2.remap is much faster and handles all channels simultaneously
+        cube_img = cv2.remap(equ_img,
+                            self.coor_x.astype(np.float32),
+                            self.coor_y.astype(np.float32),
+                            cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_WRAP)
 
         if equ_dep is not None:
-            cube_dep = np.stack([self.sample_equirec(equ_dep[..., i], order=0)
-                                 for i in range(equ_dep.shape[2])], axis=-1)
+            cube_dep = cv2.remap(equ_dep,
+                                self.coor_x.astype(np.float32),
+                                self.coor_y.astype(np.float32),
+                                cv2.INTER_NEAREST,
+                                borderMode=cv2.BORDER_WRAP)
             cube_dep = cube_dep * self.cosmaps
 
         if equ_dep is not None:

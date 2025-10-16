@@ -13,7 +13,6 @@ import torch
 from torchvision import transforms
 from numba import njit
 import math
-import time
 
 # Depth Anywhere のモデル実装パス
 from depth_anywhere_ros2.baseline_models.UniFuse.networks import UniFuse
@@ -94,7 +93,7 @@ class DepthAnywherePCL(Node):
         super().__init__('depth_anywhere_pcl')
 
         # --- ROS パラメータ ---
-        self.declare_parameter('model_name',       'EGFormer')  # UniFuseより軽量
+        self.declare_parameter('model_name',       'UniFuse')  # UniFuseをデフォルトに
         self.declare_parameter('equi_h',           512)
         self.declare_parameter('equi_w',           1024)
         self.declare_parameter('input_h',          256)  # 入力画像の高さ（モデル解像度より小さく）
@@ -102,8 +101,9 @@ class DepthAnywherePCL(Node):
         self.declare_parameter('device',           'cuda')
         self.declare_parameter('scale_factor',       2.0)
         self.declare_parameter('use_fp16',         True)
-        self.declare_parameter('pcl_downsample',   2)  # 点群を1/2に削減（バランス）
+        self.declare_parameter('pcl_downsample',   4)  # 点群を1/4に削減
         self.declare_parameter('num_layers',       18)  # ResNetバックボーン: 18(軽量) or 34(デフォルト)
+        self.declare_parameter('frame_skip',       1)  # フレームスキップ（1なら全フレーム処理、2なら2フレームに1回処理）
 
         self.model_name   = self.get_parameter('model_name').get_parameter_value().string_value
         H            = self.get_parameter('equi_h').get_parameter_value().integer_value
@@ -115,8 +115,8 @@ class DepthAnywherePCL(Node):
         self.use_fp16 = self.get_parameter('use_fp16').get_parameter_value().bool_value
         self.pcl_downsample = self.get_parameter('pcl_downsample').get_parameter_value().integer_value
         num_layers = self.get_parameter('num_layers').get_parameter_value().integer_value
+        self.frame_skip = self.get_parameter('frame_skip').get_parameter_value().integer_value
 
-        # フレームカウンタ
         self.frame_count = 0
 
         # モデルロード
@@ -130,10 +130,6 @@ class DepthAnywherePCL(Node):
         if self.use_fp16 and self.device.type == 'cuda':
             self.net = self.net.half()
             self.get_logger().info('Using FP16 precision for inference')
-
-        # PyTorch 2.x のコンパイル最適化（Jetsonでは無効化）
-        # torch.compile()はTritonが必要だが、Jetsonではサポートされていないためスキップ
-        # self.get_logger().info('torch.compile() is not supported on Jetson platform')
 
         self.requires_cube = (self.model_name.upper() == 'UNIFUSE')
         self.get_logger().info(f'Loaded {self.model_name} on {device} (cube={self.requires_cube}, fp16={self.use_fp16})')
@@ -182,11 +178,15 @@ class DepthAnywherePCL(Node):
         self.get_logger().info('Node initialized, waiting for images...')
 
     def cb_image(self, msg: Image):
-        t_start = time.time()
+        # フレームスキップ
         self.frame_count += 1
+        if self.frame_skip > 1:
+            if self.frame_count % self.frame_skip != 0:
+                return
+            else:
+                self.frame_count = 0
 
         # 1) 画像取出し → 前処理（入力解像度で処理）
-        t1 = time.time()
         img_rgb = self.br.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         # 入力解像度にリサイズ（モデル解像度より小さい場合がある）
         img_rgb = cv2.resize(img_rgb, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
@@ -203,22 +203,23 @@ class DepthAnywherePCL(Node):
         if self.use_fp16 and self.device.type == 'cuda':
             rgb_t = rgb_t.half()
 
-        t2 = time.time()
+        # 2) Cube変換（UniFuseの場合）
+        if self.requires_cube:
+            cube = self.E2C.run(img_for_model)
+            cube_t = self.normalize(self.to_tensor(cube)).unsqueeze(0).to(self.device, non_blocking=True)
+            if self.use_fp16 and self.device.type == 'cuda':
+                cube_t = cube_t.half()
 
-        # 2) 推論 (torch.ampで自動混合精度)
+        # 3) 推論 (torch.ampで自動混合精度)
         with torch.no_grad():
             if self.use_fp16 and self.device.type == 'cuda':
                 with torch.amp.autocast('cuda'):
                     if self.requires_cube:
-                        cube = self.E2C.run(img_for_model)
-                        cube_t = self.normalize(self.to_tensor(cube)).unsqueeze(0).to(self.device, non_blocking=True)
                         out = self.net(rgb_t, cube_t)
                     else:
                         out = self.net(rgb_t)
             else:
                 if self.requires_cube:
-                    cube = self.E2C.run(img_for_model)
-                    cube_t = self.normalize(self.to_tensor(cube)).unsqueeze(0).to(self.device, non_blocking=True)
                     out = self.net(rgb_t, cube_t)
                 else:
                     out = self.net(rgb_t)
@@ -230,8 +231,6 @@ class DepthAnywherePCL(Node):
         # FP16の場合はFP32に変換（OpenCV互換性のため）
         if depth.dtype == np.float16:
             depth = depth.astype(np.float32)
-
-        t3 = time.time()
 
         # 3) バックプロジェクト → 点群＋色（入力解像度ベース）
         # 入力解像度の画像を使用して点群を生成
@@ -261,7 +260,6 @@ class DepthAnywherePCL(Node):
 
        # --- 3) フィルタ & 構造化データ作成 ---
         # JIT 関数でマスク適用 & 結合
-        t4 = time.time()
         filtered = apply_mask(pts, colors)
 
         header = msg.header
@@ -270,22 +268,7 @@ class DepthAnywherePCL(Node):
         cloud = pc2.create_cloud(header, self.fields, filtered)
 
         # 5) パブリッシュ
-        t5 = time.time()
         self.pub.publish(cloud)
-
-        t_end = time.time()
-
-        # プロファイリング情報を出力（10フレームごと）
-        if self.frame_count % 10 == 0:
-            self.get_logger().info(
-                f'Profiling (ms): '
-                f'Preprocessing={int((t2-t1)*1000)}, '
-                f'Inference={int((t3-t2)*1000)}, '
-                f'Postprocess={int((t4-t3)*1000)}, '
-                f'Filter={int((t5-t4)*1000)}, '
-                f'Publish={int((t_end-t5)*1000)}, '
-                f'Total={int((t_end-t_start)*1000)}'
-            )
 
 def main(args=None):
     rclpy.init(args=args)
