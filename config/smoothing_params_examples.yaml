@@ -1,0 +1,109 @@
+# Depth Anywhere ROS2 平滑化パラメータ設定例
+# 
+# 使用方法:
+# ros2 run depth_anywhere_ros2 infer --ros-args --params-file <このファイルへのパス>
+
+# ============================================================================
+# 例1: Bilateral Filter（床の平面を保ちながらゆらぎを抑える - 推奨）
+# ============================================================================
+depth_anywhere_pcl_bilateral:
+  ros__parameters:
+    # 空間的平滑化
+    spatial_smooth_kernel: 7              # カーネルサイズ（奇数のみ、大きいほど強く平滑化）
+    spatial_smooth_method: 'bilateral'    # bilateral filter使用
+    bilateral_sigma_color: 0.05           # 深度差の許容範囲（小さいほどエッジ保持が強い）
+                                          # 0.05 = 5cm以内の深度差を同じ平面とみなす
+    bilateral_sigma_space: 7.0            # 空間的影響範囲（大きいほど広範囲で平滑化）
+    
+    # 時間的平滑化
+    temporal_smooth_alpha: 0.6            # 過去フレームの影響度（0.0-1.0）
+    temporal_smooth_frames: 8             # 保持する過去フレーム数
+    
+    # その他
+    pcl_downsample: 4                     # 点群ダウンサンプリング
+    frame_skip: 1                         # フレームスキップ（1=全フレーム処理）
+
+# ============================================================================
+# 例2: Plane-Aware Smoothing（床などの平面部分を特に重視）
+# ============================================================================
+depth_anywhere_pcl_plane_aware:
+  ros__parameters:
+    spatial_smooth_kernel: 9              # より大きなカーネルで平面を滑らかに
+    spatial_smooth_method: 'plane_aware'  # 平面保持型平滑化
+    plane_threshold: 0.015                # 平面判定の深度勾配閾値（小さいほど厳密）
+                                          # 0.015 = 1.5cm/pixel以下の勾配を平面とみなす
+    
+    temporal_smooth_alpha: 0.7
+    temporal_smooth_frames: 10
+    
+    pcl_downsample: 4
+    frame_skip: 1
+
+# ============================================================================
+# 例3: ガウシアンブラー（軽量、リアルタイム性重視）
+# ============================================================================
+depth_anywhere_pcl_gaussian:
+  ros__parameters:
+    spatial_smooth_kernel: 5
+    spatial_smooth_method: 'gaussian'     # 標準ガウシアン（最速）
+    
+    temporal_smooth_alpha: 0.5
+    temporal_smooth_frames: 5
+    
+    pcl_downsample: 4
+    frame_skip: 1
+
+# ============================================================================
+# 例4: 強力な平滑化（ゆらぎ最小限、TPS表示優先）
+# ============================================================================
+depth_anywhere_pcl_strong:
+  ros__parameters:
+    spatial_smooth_kernel: 11             # 大きなカーネル
+    spatial_smooth_method: 'bilateral'
+    bilateral_sigma_color: 0.08           # やや寛容（広い範囲を平面とみなす）
+    bilateral_sigma_space: 10.0           # 広範囲で平滑化
+    
+    temporal_smooth_alpha: 0.8            # 過去フレームの影響大
+    temporal_smooth_frames: 15            # 多くのフレームで平均
+    
+    pcl_downsample: 4
+    frame_skip: 1
+
+# ============================================================================
+# 例5: 平滑化無効（オリジナルの深度マップ）
+# ============================================================================
+depth_anywhere_pcl_no_smoothing:
+  ros__parameters:
+    spatial_smooth_kernel: 0              # 空間平滑化無効
+    temporal_smooth_alpha: 0.0            # 時間平滑化無効
+    
+    pcl_downsample: 4
+    frame_skip: 1
+
+# ============================================================================
+# パラメータ調整のガイドライン
+# ============================================================================
+#
+# 【Bilateral Filter】（エッジ保存型）
+#   - bilateral_sigma_color: 0.03-0.1（小さい=エッジ保持強、大きい=より滑らか）
+#   - bilateral_sigma_space: 5.0-15.0（大きい=広範囲平滑化）
+#   - 床の平面を保ちながら壁との境界もシャープに保つ
+#   - 処理速度: ガウシアンの3-5倍遅い
+#
+# 【Plane-Aware Smoothing】（平面重視型）
+#   - plane_threshold: 0.01-0.03（小さい=平面判定が厳密）
+#   - 平面部分には強い平滑化、エッジ部分には弱い平滑化
+#   - 床が特にきれいに表示される
+#   - 処理速度: ガウシアンの2倍程度
+#
+# 【Gaussian】（標準型）
+#   - 最速、シンプル
+#   - エッジもぼやける（壁に引っ張られる問題）
+#
+# 【時間的平滑化】
+#   - temporal_smooth_alpha: 0.5-0.8が推奨
+#   - 大きいほど過去フレームの影響が強く、動きに対する追従が遅くなる
+#
+# 【カーネルサイズ】
+#   - 3, 5, 7, 9, 11（奇数のみ）
+#   - 大きいほど強く平滑化されるが、処理時間も増加

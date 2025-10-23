@@ -1,0 +1,61 @@
+# Depth Anywhere ROS2 平滑化パラメータ設定
+
+depth_anywhere_pcl:
+  ros__parameters:
+    # モデル設定
+    model_name: 'UniFuse'  # UniFuse, BiFuseV2, HoHoNet, EGFormer
+    equi_h: 512
+    equi_w: 1024
+    input_h: 256
+    input_w: 512
+    device: 'cuda'
+    scale_factor: 2.0
+    use_fp16: true
+    pcl_downsample: 4
+    num_layers: 18
+    frame_skip: 1
+    
+    # ========================================
+    # 平滑化パラメータ
+    # ========================================
+    
+    # 空間的平滑化（ガウシアンブラー）
+    # 0 = 無効
+    # 3, 5, 7, 9 など奇数値を推奨（大きいほど強い平滑化）
+    # 推奨値: 3-7（メッシュのノイズを減らす）
+    spatial_smooth_kernel: 5
+    
+    # 時間的平滑化（指数移動平均）
+    # 0.0 = 無効
+    # 0.0-1.0: 大きいほど過去フレームの影響が大きい
+    # 推奨値: 0.5-0.8（フレーム間のゆらぎを減らす）
+    temporal_smooth_alpha: 0.7
+    
+    # 時間的平滑化で保持する過去フレーム数
+    # 1-10 程度を推奨（大きいほどメモリ使用量増加）
+    temporal_smooth_frames: 5
+
+
+# ========================================
+# 設定例
+# ========================================
+
+# 【軽い平滑化】 - 細かいディテールを保ちつつノイズを軽減
+# spatial_smooth_kernel: 3
+# temporal_smooth_alpha: 0.5
+# temporal_smooth_frames: 3
+
+# 【標準的な平滑化】 - バランスの取れた設定（推奨）
+# spatial_smooth_kernel: 5
+# temporal_smooth_alpha: 0.7
+# temporal_smooth_frames: 5
+
+# 【強い平滑化】 - ゆらぎを最大限抑える（ディテール減少）
+# spatial_smooth_kernel: 7
+# temporal_smooth_alpha: 0.85
+# temporal_smooth_frames: 8
+
+# 【平滑化無効】 - 元の動作
+# spatial_smooth_kernel: 0
+# temporal_smooth_alpha: 0.0
+# temporal_smooth_frames: 0
