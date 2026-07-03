@@ -61,6 +61,7 @@ setup(
     entry_points={
         'console_scripts': [
             "infer = depth_anywhere_ros2.infer:main",
+            "infer_multi = depth_anywhere_ros2.infer_multi:main",
         ],
     },
 )

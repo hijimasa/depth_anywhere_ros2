@@ -3,7 +3,6 @@ import os
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
-import sensor_msgs_py.point_cloud2 as pc2
 from cv_bridge import CvBridge
 from ament_index_python.packages import get_package_share_directory
 
@@ -11,8 +10,6 @@ import cv2
 import numpy as np
 import torch
 from torchvision import transforms
-from numba import njit
-import math
 
 # Depth Anywhere のモデル実装パス
 from depth_anywhere_ros2.baseline_models.UniFuse.networks import UniFuse
@@ -22,21 +19,12 @@ from depth_anywhere_ros2.baseline_models.EGformer.models.egformer import EGDepth
 
 # equirect→cube 変換ユーティリティ
 from depth_anywhere_ros2.utils.Projection import py360_E2C
+from depth_anywhere_ros2.smoothing import DepthSmoother
 
 np.bool = np.bool_
 np.float = np.float32
 MEAN = [0.485, 0.456, 0.406]
 STD  = [0.229, 0.224, 0.225]
-
-# JITコンパイルでフィルタ処理を高速化
-@njit(fastmath=True)
-def apply_mask(pts, rgb):
-    N = pts.shape[0]
-    out = []
-    for i in range(N):
-        # if pts[i, 1] <= 1.6 and math.hypot(pts[i, 0], pts[i, 2]) >= 0.1:
-        out.append((pts[i, 0], pts[i, 2], pts[i, 1], rgb[i]))
-    return out
 
 def load_model(device: str, model_name: str, equi_h: int = 512, equi_w: int = 1024, num_layers: int = 18):
     """Depth Anywhere の各モデルをロードして eval モードに"""
@@ -84,7 +72,13 @@ def load_model(device: str, model_name: str, equi_h: int = 512, equi_w: int = 10
             net.ref_point16x32 = net.ref_point16x32.to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    net.load_state_dict(ckpt)
+    # Cube2Equirec の sample_grid は解像度依存だが __init__ で再計算されるため、
+    # 形状が一致するキーだけロードする。これで equi_h/equi_w を
+    # 学習時の 512x1024 以外に設定しても既存の pth がそのまま使える。
+    model_sd = net.state_dict()
+    loadable = {k: v for k, v in ckpt.items()
+                if k in model_sd and model_sd[k].shape == v.shape}
+    net.load_state_dict(loadable, strict=False)
     net.eval()
     return net
 
@@ -104,6 +98,8 @@ class DepthAnywherePCL(Node):
         self.declare_parameter('pcl_downsample',   4)  # 点群を1/4に削減
         self.declare_parameter('num_layers',       18)  # ResNetバックボーン: 18(軽量) or 34(デフォルト)
         self.declare_parameter('frame_skip',       1)  # フレームスキップ（1なら全フレーム処理、2なら2フレームに1回処理）
+        self.declare_parameter('publish_pointcloud', True)   # 従来の PointCloud2 出力
+        self.declare_parameter('publish_depth',      True)   # 半径マップ(32FC1 Image)出力。tkg_tps_viewer_gl の depth モード用
         
         # 平滑化パラメータ
         self.declare_parameter('spatial_smooth_kernel', 0)  # 空間的平滑化カーネルサイズ（0=無効, 3,5,7など奇数推奨）
@@ -125,6 +121,8 @@ class DepthAnywherePCL(Node):
         self.pcl_downsample = self.get_parameter('pcl_downsample').get_parameter_value().integer_value
         num_layers = self.get_parameter('num_layers').get_parameter_value().integer_value
         self.frame_skip = self.get_parameter('frame_skip').get_parameter_value().integer_value
+        self.publish_pointcloud = self.get_parameter('publish_pointcloud').get_parameter_value().bool_value
+        self.publish_depth = self.get_parameter('publish_depth').get_parameter_value().bool_value
         
         # 平滑化パラメータの取得
         self.spatial_kernel = self.get_parameter('spatial_smooth_kernel').get_parameter_value().integer_value
@@ -136,9 +134,16 @@ class DepthAnywherePCL(Node):
         self.temporal_frames = self.get_parameter('temporal_smooth_frames').get_parameter_value().integer_value
 
         self.frame_count = 0
-        
-        # 時間的平滑化用のバッファ（過去の深度マップを保持）
-        self.depth_history = []
+
+        self.smoother = DepthSmoother(
+            spatial_kernel=self.spatial_kernel,
+            spatial_method=self.spatial_method,
+            bilateral_sigma_color=self.bilateral_sigma_color,
+            bilateral_sigma_space=self.bilateral_sigma_space,
+            plane_threshold=self.plane_threshold,
+            temporal_alpha=self.temporal_alpha,
+            temporal_frames=self.temporal_frames,
+        )
         if self.temporal_alpha > 0.0 and self.temporal_frames > 0:
             self.get_logger().info(f'Temporal smoothing enabled: alpha={self.temporal_alpha}, frames={self.temporal_frames}')
         if self.spatial_kernel > 0:
@@ -148,6 +153,9 @@ class DepthAnywherePCL(Node):
         # デバイス設定
         # 'cuda' / 'cpu' の文字列から torch.device を生成
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        if self.device.type == 'cuda':
+            # 入力形状が固定なので autotuner で最速の conv アルゴリズムを選ばせる
+            torch.backends.cudnn.benchmark = True
         # モデルロード（self.device と解像度を渡す）
         self.net = load_model(self.device, self.model_name, H, W, num_layers)
 
@@ -169,6 +177,7 @@ class DepthAnywherePCL(Node):
         self.br  = CvBridge()
         self.sub = self.create_subscription(Image, "image", self.cb_image, 1)
         self.pub = self.create_publisher(PointCloud2, "points", 1)
+        self.pub_depth = self.create_publisher(Image, "depth", 1)
 
         # equirectangular→方向ベクトルマップを事前生成（入力解像度ベース）
         self.H = H; self.W = W
@@ -194,6 +203,8 @@ class DepthAnywherePCL(Node):
             PointField(name='z',   offset=8,  datatype=PointField.FLOAT32, count=1),
             PointField(name='rgb', offset=12, datatype=PointField.INT32,   count=1),
         ]
+        self.point_dtype = np.dtype([('x', np.float32), ('y', np.float32),
+                                     ('z', np.float32), ('rgb', np.int32)])
 
         self.to_tensor  = transforms.ToTensor()
         self.normalize  = transforms.Normalize(mean=MEAN, std=STD)
@@ -201,157 +212,6 @@ class DepthAnywherePCL(Node):
             self.E2C = py360_E2C(equ_h=self.H, equ_w=self.W, face_w=self.H//2)
 
         self.get_logger().info('Node initialized, waiting for images...')
-
-    def apply_spatial_smoothing(self, depth_map):
-        """空間的平滑化: 複数の手法から選択"""
-        # 無効値や偶数カーネルは無効化
-        if self.spatial_kernel <= 0 or self.spatial_kernel % 2 == 0:
-            return depth_map
-
-        method = self.spatial_method.lower()
-        
-        if method == 'bilateral':
-            return self._apply_bilateral_filter(depth_map)
-        elif method == 'plane_aware':
-            return self._apply_plane_aware_smoothing(depth_map)
-        else:  # 'gaussian' or default
-            return self._apply_gaussian_smoothing(depth_map)
-    
-    def _apply_gaussian_smoothing(self, depth_map):
-        """ガウシアンブラー（NaN対応）"""
-        # 有限値マスク
-        finite_mask = np.isfinite(depth_map).astype(np.float32)
-        depth_zeroed = np.where(finite_mask, depth_map, 0.0).astype(np.float32)
-        
-        k = self.spatial_kernel
-        depth_blurred = cv2.GaussianBlur(depth_zeroed, (k, k), 0)
-        mask_blurred = cv2.GaussianBlur(finite_mask, (k, k), 0)
-        
-        eps = 1e-6
-        safe_mask = np.where(mask_blurred > eps, mask_blurred, 0.0)
-        
-        smoothed = np.zeros_like(depth_blurred, dtype=np.float32)
-        valid = safe_mask > 0
-        smoothed[valid] = depth_blurred[valid] / safe_mask[valid]
-        smoothed[~np.isfinite(smoothed)] = np.nan
-        
-        return smoothed
-    
-    def _apply_bilateral_filter(self, depth_map):
-        """Bilateral Filter（エッジ保存型平滑化、NaN対応）
-        
-        床などの平面部分は滑らかにしながら、壁との境界などの深度不連続は保持する。
-        """
-        # 有限値マスク
-        finite_mask = np.isfinite(depth_map).astype(np.float32)
-        depth_zeroed = np.where(finite_mask, depth_map, 0.0).astype(np.float32)
-        
-        # OpenCVのbilateralFilterはNaNに対応していないため、有限値のみで処理
-        # sigma_color: 深度値の差がこの範囲内なら同じ平面とみなす（小さいほどエッジ保持が強い）
-        # sigma_space: 空間的な近傍範囲（大きいほど広範囲で平滑化）
-        
-        # カーネルサイズをdiameterとして使用
-        d = self.spatial_kernel
-        sigma_color = self.bilateral_sigma_color * 255.0  # OpenCVは0-255スケールを想定
-        sigma_space = self.bilateral_sigma_space
-        
-        # 深度値を0-1の範囲に正規化してからbilateralFilterを適用
-        depth_min = np.nanmin(depth_zeroed[finite_mask > 0]) if np.any(finite_mask > 0) else 0.0
-        depth_max = np.nanmax(depth_zeroed[finite_mask > 0]) if np.any(finite_mask > 0) else 1.0
-        depth_range = depth_max - depth_min
-        
-        if depth_range > 1e-6:
-            depth_normalized = ((depth_zeroed - depth_min) / depth_range * 255.0).astype(np.float32)
-        else:
-            depth_normalized = depth_zeroed.astype(np.float32)
-        
-        # Bilateral filter適用
-        depth_filtered = cv2.bilateralFilter(depth_normalized, d, sigma_color, sigma_space)
-        
-        # 元のスケールに戻す
-        if depth_range > 1e-6:
-            depth_filtered = depth_filtered / 255.0 * depth_range + depth_min
-        
-        # マスクで正規化（bilateral filterの境界処理を補正）
-        mask_blurred = cv2.GaussianBlur(finite_mask, (self.spatial_kernel, self.spatial_kernel), 0)
-        eps = 1e-6
-        
-        smoothed = np.zeros_like(depth_filtered, dtype=np.float32)
-        valid = (mask_blurred > eps) & (finite_mask > 0)
-        smoothed[valid] = depth_filtered[valid]
-        
-        # 無効ポイントはNaNを保持
-        smoothed[~valid] = np.nan
-        
-        return smoothed
-    
-    def _apply_plane_aware_smoothing(self, depth_map):
-        """平面保持型平滑化
-        
-        局所的な深度勾配を計算し、平面部分（床など）は強く平滑化、
-        エッジ部分（壁との境界）は弱く平滑化する。
-        """
-        # 有限値マスク
-        finite_mask = np.isfinite(depth_map).astype(np.float32)
-        depth_zeroed = np.where(finite_mask, depth_map, 0.0).astype(np.float32)
-        
-        # 深度勾配を計算（Sobelフィルタ）
-        grad_x = cv2.Sobel(depth_zeroed, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(depth_zeroed, cv2.CV_32F, 0, 1, ksize=3)
-        grad_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
-        # 勾配が小さい部分を平面として検出
-        plane_mask = (grad_magnitude < self.plane_threshold).astype(np.float32)
-        
-        # 平面部分には強いガウシアン平滑化
-        k_strong = max(self.spatial_kernel, 5)  # より大きなカーネル
-        depth_strong = cv2.GaussianBlur(depth_zeroed, (k_strong, k_strong), 0)
-        
-        # エッジ部分には弱い平滑化
-        k_weak = 3
-        depth_weak = cv2.GaussianBlur(depth_zeroed, (k_weak, k_weak), 0)
-        
-        # 平面マスクで重み付け合成
-        # plane_mask が 1 に近いほど strong smoothing を適用
-        smoothed = plane_mask * depth_strong + (1.0 - plane_mask) * depth_weak
-        
-        # マスクで正規化
-        mask_blurred = cv2.GaussianBlur(finite_mask, (self.spatial_kernel, self.spatial_kernel), 0)
-        eps = 1e-6
-        safe_mask = np.where(mask_blurred > eps, mask_blurred, 0.0)
-        
-        result = np.zeros_like(smoothed, dtype=np.float32)
-        valid = safe_mask > 0
-        result[valid] = smoothed[valid] / safe_mask[valid]
-        
-        # 無効ポイントはNaNを保持
-        result[~np.isfinite(result)] = np.nan
-        
-        return result
-    
-    def apply_temporal_smoothing(self, depth_map):
-        """時間的平滑化: 過去フレームとの加重平均"""
-        if self.temporal_alpha <= 0.0 or self.temporal_frames <= 0:
-            return depth_map
-        
-        # 現在のフレームを履歴に追加
-        self.depth_history.append(depth_map.copy())
-        
-        # 指定フレーム数を超えたら古いものを削除
-        if len(self.depth_history) > self.temporal_frames:
-            self.depth_history.pop(0)
-        
-        # 履歴が1つしかない場合はそのまま返す
-        if len(self.depth_history) == 1:
-            return depth_map
-        
-        # 指数移動平均 (EMA) を計算
-        # alpha が大きいほど過去の影響が大きい
-        smoothed = self.depth_history[0].copy()
-        for i in range(1, len(self.depth_history)):
-            smoothed = self.temporal_alpha * smoothed + (1.0 - self.temporal_alpha) * self.depth_history[i]
-        
-        return smoothed
 
     def cb_image(self, msg: Image):
         # フレームスキップ
@@ -408,50 +268,67 @@ class DepthAnywherePCL(Node):
         if depth.dtype == np.float16:
             depth = depth.astype(np.float32)
 
-        # 3) バックプロジェクト → 点群＋色（入力解像度ベース）
-        # 入力解像度の画像を使用して点群を生成
+        # 3) 深度マップを入力解像度に揃え、平滑化してから半径マップに変換
         if self.input_h != self.H or self.input_w != self.W:
-            # 深度マップを入力解像度にダウンサンプリング
             depth_resized = cv2.resize(depth, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
         else:
             depth_resized = depth
 
-        # ダウンサンプリング
-        if self.pcl_downsample > 1:
-            depth_ds = depth_resized[::self.pcl_downsample, ::self.pcl_downsample]
-            img_rgb_ds = img_rgb[::self.pcl_downsample, ::self.pcl_downsample]
+        # === 平滑化処理（全解像度で実施） ===
+        depth_resized = self.smoother.apply(depth_resized)
+
+        # 各画素の視線方向に掛ける半径 [m]（従来の点群の pts = dirs * radius と同じスケール）
+        if self.model_name.upper() == 'UNIFUSE' or self.model_name.upper() == 'BIFUSEV2':
+            radius = (self.scale_factor / (depth_resized + 1e-6)).astype(np.float32)
         else:
-            depth_ds = depth_resized
-            img_rgb_ds = img_rgb
-
-        # === 平滑化処理 ===
-        # 1. 空間的平滑化（ガウシアンブラー）
-        depth_ds = self.apply_spatial_smoothing(depth_ds)
-
-        # 2. 時間的平滑化（過去フレームとの加重平均）
-        depth_ds = self.apply_temporal_smoothing(depth_ds)
-
-        if self.model_name.upper() == 'UNIFUSE' or  self.model_name.upper() == 'BIFUSEV2':
-            pts    = (self.dirs / (depth_ds[...,None] + 1e-6) * self.scale_factor).reshape(-1, 3)
-        else:
-            pts    = (self.dirs / (depth_ds[...,None] - depth_ds.min() + 1e-6) * self.scale_factor).reshape(-1, 3)
-
-        colors_img = img_rgb_ds.reshape(-1, 3)
-        colors = (colors_img[:,0].astype(np.int32) << 16) | \
-                 (colors_img[:,1].astype(np.int32) << 8)  | \
-                  colors_img[:,2].astype(np.int32)
-
-       # --- 3) フィルタ & 構造化データ作成 ---
-        # JIT 関数でマスク適用 & 結合
-        filtered = apply_mask(pts, colors)
+            radius = (self.scale_factor / (depth_resized - np.nanmin(depth_resized) + 1e-6)).astype(np.float32)
 
         header = msg.header
         header.frame_id = 'camera_link'
         header.stamp = self.get_clock().now().to_msg()
-        cloud = pc2.create_cloud(header, self.fields, filtered)
 
-        # 5) パブリッシュ
-        self.pub.publish(cloud)
+        # 4a) 半径マップを 32FC1 Image でパブリッシュ（tkg_tps_viewer_gl の depth モード用）
+        if self.publish_depth:
+            depth_msg = self.br.cv2_to_imgmsg(radius, encoding='32FC1')
+            depth_msg.header = header
+            self.pub_depth.publish(depth_msg)
+
+        # 4b) PointCloud2 パブリッシュ（従来の点群コンシューマ用）
+        if self.publish_pointcloud:
+            if self.pcl_downsample > 1:
+                radius_ds = radius[::self.pcl_downsample, ::self.pcl_downsample]
+                img_rgb_ds = img_rgb[::self.pcl_downsample, ::self.pcl_downsample]
+            else:
+                radius_ds = radius
+                img_rgb_ds = img_rgb
+
+            pts = (self.dirs * radius_ds[..., None]).reshape(-1, 3)
+
+            colors_img = img_rgb_ds.reshape(-1, 3)
+            colors = (colors_img[:, 0].astype(np.int32) << 16) | \
+                     (colors_img[:, 1].astype(np.int32) << 8) | \
+                     colors_img[:, 2].astype(np.int32)
+
+            # ベクトル化した PointCloud2 生成（点ごとの Python ループを排除）
+            n = pts.shape[0]
+            cloud_arr = np.empty(n, dtype=self.point_dtype)
+            cloud_arr['x'] = pts[:, 0]
+            cloud_arr['y'] = pts[:, 2]
+            cloud_arr['z'] = pts[:, 1]
+            cloud_arr['rgb'] = colors
+
+            cloud = PointCloud2(
+                header=header,
+                height=1,
+                width=n,
+                fields=self.fields,
+                is_bigendian=False,
+                point_step=cloud_arr.itemsize,
+                row_step=cloud_arr.itemsize * n,
+                is_dense=False,
+                data=cloud_arr.tobytes(),
+            )
+            self.pub.publish(cloud)
 
 def main(args=None):
     rclpy.init(args=args)
