@@ -277,11 +277,10 @@ class DepthAnywherePCL(Node):
         # === 平滑化処理（全解像度で実施） ===
         depth_resized = self.smoother.apply(depth_resized)
 
-        # 各画素の視線方向に掛ける半径 [m]（従来の点群の pts = dirs * radius と同じスケール）
-        if self.model_name.upper() == 'UNIFUSE' or self.model_name.upper() == 'BIFUSEV2':
-            radius = (self.scale_factor / (depth_resized + 1e-6)).astype(np.float32)
-        else:
-            radius = (self.scale_factor / (depth_resized - np.nanmin(depth_resized) + 1e-6)).astype(np.float32)
+        # pred_depth は距離とともに増加する(相対)深度。逆数を取るとシーンが
+        # 半径方向に反転する（実画像で検証済み）。絶対距離への変換はビューワ側の
+        # 床基準アフィン較正 d=(r-β)/α が行う。
+        radius = (self.scale_factor * depth_resized).astype(np.float32)
 
         header = msg.header
         header.frame_id = 'camera_link'
