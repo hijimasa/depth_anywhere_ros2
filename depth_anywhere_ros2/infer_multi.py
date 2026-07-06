@@ -307,10 +307,7 @@ class DepthAnywhereMulti(Node):
                                    interpolation=cv2.INTER_LINEAR)
             depth = self.smoothers[i].apply(depth)
 
-            # pred_depth は「シフト付き逆深度」(近いほど大、遠いほど小。実データで検証済み)。
-            # ここではそのまま配信し、絶対距離への変換 d = α/(r−β) は
-            # ビューワ側の床基準アフィン較正が行う（β があるため単純な逆数は不可）。
-            radius = (self.scale_factor * depth).astype(np.float32)
+            radius = (self.scale_factor / (depth + 1e-6)).astype(np.float32)
 
             header = self.latest_msgs[i].header
             header.frame_id = 'camera_link'
