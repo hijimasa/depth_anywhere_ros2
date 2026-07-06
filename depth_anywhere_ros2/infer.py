@@ -94,6 +94,14 @@ class DepthAnywherePCL(Node):
         self.declare_parameter('input_w',          512)  # 入力画像の幅（モデル解像度より小さく）
         self.declare_parameter('device',           'cuda')
         self.declare_parameter('scale_factor',       2.0)
+        # 距離変換 r = disp_alpha / (pred - disp_beta)。
+        # UniFuse/BiFuseV2 (Depth Anywhere ckpt) の出力はスケール・シフト不定の視差
+        # (pred ≈ a/r + b) なので、逆数ではなくアフィン合わせ後に逆数を取る。
+        # 既定値は rosbag 実データ(theta1)への最小二乗フィット (2026-07-06)。
+        # disp_alpha=0.0 で従来の scale_factor/pred にフォールバック。
+        self.declare_parameter('disp_alpha',         0.9)
+        self.declare_parameter('disp_beta',          1.45)
+        self.declare_parameter('max_range',          10.0)
         self.declare_parameter('use_fp16',         True)
         self.declare_parameter('pcl_downsample',   4)  # 点群を1/4に削減
         self.declare_parameter('num_layers',       18)  # ResNetバックボーン: 18(軽量) or 34(デフォルト)
@@ -117,6 +125,9 @@ class DepthAnywherePCL(Node):
         self.input_w = self.get_parameter('input_w').get_parameter_value().integer_value
         device       = self.get_parameter('device').get_parameter_value().string_value
         self.scale_factor = self.get_parameter('scale_factor').get_parameter_value().double_value
+        self.disp_alpha = self.get_parameter('disp_alpha').get_parameter_value().double_value
+        self.disp_beta = self.get_parameter('disp_beta').get_parameter_value().double_value
+        self.max_range = self.get_parameter('max_range').get_parameter_value().double_value
         self.use_fp16 = self.get_parameter('use_fp16').get_parameter_value().bool_value
         self.pcl_downsample = self.get_parameter('pcl_downsample').get_parameter_value().integer_value
         num_layers = self.get_parameter('num_layers').get_parameter_value().integer_value
@@ -279,7 +290,14 @@ class DepthAnywherePCL(Node):
 
         # 各画素の視線方向に掛ける半径 [m]（従来の点群の pts = dirs * radius と同じスケール）
         if self.model_name.upper() == 'UNIFUSE' or self.model_name.upper() == 'BIFUSEV2':
-            radius = (self.scale_factor / (depth_resized + 1e-6)).astype(np.float32)
+            if self.disp_alpha > 0.0:
+                # 逆距離 1/r = (pred - β)/α。遠方(分母≤0含む)は max_range に飽和させ、
+                # 穴(inf/負)を作らない
+                inv = (depth_resized - self.disp_beta) / self.disp_alpha
+                np.clip(inv, 1.0 / self.max_range, None, out=inv)
+                radius = (1.0 / inv).astype(np.float32)
+            else:
+                radius = (self.scale_factor / (depth_resized + 1e-6)).astype(np.float32)
         else:
             radius = (self.scale_factor / (depth_resized - np.nanmin(depth_resized) + 1e-6)).astype(np.float32)
 

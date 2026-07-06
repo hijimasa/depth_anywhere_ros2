@@ -157,6 +157,14 @@ class DepthAnywhereMulti(Node):
         self.declare_parameter('input_w',          512)
         self.declare_parameter('device',           'cuda')
         self.declare_parameter('scale_factor',     2.0)
+        # 距離変換 r = disp_alpha / (pred - disp_beta)。
+        # UniFuse(Depth Anywhere ckpt) の出力はスケール・シフト不定の視差
+        # (pred ≈ a/r + b) なので、逆数ではなくアフィン合わせ後に逆数を取る。
+        # 既定値は rosbag 実データへの最小二乗フィット (2026-07-06、カメラごと)。
+        # 空リストを渡すと従来の scale_factor/pred にフォールバック。
+        self.declare_parameter('disp_alpha',       [0.9, 0.85])
+        self.declare_parameter('disp_beta',        [1.45, 1.85])
+        self.declare_parameter('max_range',        10.0)
         self.declare_parameter('use_fp16',         True)
         self.declare_parameter('num_layers',       18)
         self.declare_parameter('frame_skip',       1)
@@ -183,6 +191,17 @@ class DepthAnywhereMulti(Node):
         self.input_h = gp('input_h')
         self.input_w = gp('input_w')
         self.scale_factor = float(gp('scale_factor'))
+        alphas = [float(v) for v in (gp('disp_alpha') or [])]
+        betas = [float(v) for v in (gp('disp_beta') or [])]
+        if alphas and betas:
+            # カメラ数より短い場合は最後の値でブロードキャスト
+            self.disp_alpha = [alphas[min(i, len(alphas) - 1)]
+                               for i in range(gp('num_cameras'))]
+            self.disp_beta = [betas[min(i, len(betas) - 1)]
+                              for i in range(gp('num_cameras'))]
+        else:
+            self.disp_alpha = self.disp_beta = None
+        self.max_range = float(gp('max_range'))
         self.use_fp16 = gp('use_fp16')
         self.frame_skip = gp('frame_skip')
         self.pcl_downsample = gp('pcl_downsample')
@@ -307,7 +326,14 @@ class DepthAnywhereMulti(Node):
                                    interpolation=cv2.INTER_LINEAR)
             depth = self.smoothers[i].apply(depth)
 
-            radius = (self.scale_factor / (depth + 1e-6)).astype(np.float32)
+            if self.disp_alpha is not None:
+                # 逆距離 1/r = (pred - β)/α。遠方(分母≤0含む)は max_range に飽和させ、
+                # 穴(inf/負)を作らない
+                inv = (depth - self.disp_beta[i]) / self.disp_alpha[i]
+                np.clip(inv, 1.0 / self.max_range, None, out=inv)
+                radius = (1.0 / inv).astype(np.float32)
+            else:
+                radius = (self.scale_factor / (depth + 1e-6)).astype(np.float32)
 
             header = self.latest_msgs[i].header
             header.frame_id = 'camera_link'
