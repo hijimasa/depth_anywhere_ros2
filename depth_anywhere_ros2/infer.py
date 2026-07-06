@@ -277,9 +277,9 @@ class DepthAnywherePCL(Node):
         # === 平滑化処理（全解像度で実施） ===
         depth_resized = self.smoother.apply(depth_resized)
 
-        # pred_depth は距離とともに増加する(相対)深度。逆数を取るとシーンが
-        # 半径方向に反転する（実画像で検証済み）。絶対距離への変換はビューワ側の
-        # 床基準アフィン較正 d=(r-β)/α が行う。
+        # pred_depth は「シフト付き逆深度」(近いほど大、遠いほど小。実データで検証済み)。
+        # そのまま配信し、絶対距離への変換 d = α/(r−β) はビューワ側の
+        # 床基準アフィン較正が行う（β があるため単純な逆数は不可）。
         radius = (self.scale_factor * depth_resized).astype(np.float32)
 
         header = msg.header

@@ -307,9 +307,9 @@ class DepthAnywhereMulti(Node):
                                    interpolation=cv2.INTER_LINEAR)
             depth = self.smoothers[i].apply(depth)
 
-            # pred_depth は距離とともに増加する(相対)深度。逆数を取ると
-            # シーンが半径方向に反転する（実画像で検証済み）。
-            # 絶対距離への変換 d=(r-β)/α はビューワ側の床基準アフィン較正が行う。
+            # pred_depth は「シフト付き逆深度」(近いほど大、遠いほど小。実データで検証済み)。
+            # ここではそのまま配信し、絶対距離への変換 d = α/(r−β) は
+            # ビューワ側の床基準アフィン較正が行う（β があるため単純な逆数は不可）。
             radius = (self.scale_factor * depth).astype(np.float32)
 
             header = self.latest_msgs[i].header
