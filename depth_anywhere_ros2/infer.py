@@ -20,6 +20,7 @@ from depth_anywhere_ros2.baseline_models.EGformer.models.egformer import EGDepth
 # equirect→cube 変換ユーティリティ
 from depth_anywhere_ros2.utils.Projection import py360_E2C
 from depth_anywhere_ros2.smoothing import DepthSmoother
+from depth_anywhere_ros2.affine_calib import DepthAffineCalibrator
 
 np.bool = np.bool_
 np.float = np.float32
@@ -102,6 +103,18 @@ class DepthAnywherePCL(Node):
         self.declare_parameter('disp_alpha',         0.9)
         self.declare_parameter('disp_beta',          1.45)
         self.declare_parameter('max_range',          10.0)
+        # 床基準のオンライン較正（infer_multi と同じ。確立までは上記固定値を使用）
+        self.declare_parameter('auto_calib',         True)
+        self.declare_parameter('calib_cam_x',        0.339)
+        self.declare_parameter('calib_cam_y',        0.339)
+        self.declare_parameter('calib_cam_z',        0.529)
+        self.declare_parameter('calib_cam_yaw_deg',  45.0)
+        self.declare_parameter('calib_min_depression_deg', 20.0)
+        self.declare_parameter('calib_max_depression_deg', 60.0)
+        self.declare_parameter('calib_smoothing',    0.1)
+        self.declare_parameter('calib_exclude_halfwidth_deg', 50.0)
+        self.declare_parameter('calib_pred_min',     0.3)
+        self.declare_parameter('calib_pred_max',     9.7)
         self.declare_parameter('use_fp16',         True)
         self.declare_parameter('pcl_downsample',   4)  # 点群を1/4に削減
         self.declare_parameter('num_layers',       18)  # ResNetバックボーン: 18(軽量) or 34(デフォルト)
@@ -128,6 +141,19 @@ class DepthAnywherePCL(Node):
         self.disp_alpha = self.get_parameter('disp_alpha').get_parameter_value().double_value
         self.disp_beta = self.get_parameter('disp_beta').get_parameter_value().double_value
         self.max_range = self.get_parameter('max_range').get_parameter_value().double_value
+        self.calibrator = None
+        if self.get_parameter('auto_calib').get_parameter_value().bool_value:
+            gp = lambda n: self.get_parameter(n).get_parameter_value().double_value
+            self.calibrator = DepthAffineCalibrator(
+                gp('calib_cam_x'), gp('calib_cam_y'), gp('calib_cam_z'),
+                gp('calib_cam_yaw_deg'),
+                min_depression_deg=gp('calib_min_depression_deg'),
+                max_depression_deg=gp('calib_max_depression_deg'),
+                smoothing=gp('calib_smoothing'),
+                exclude_halfwidth_deg=gp('calib_exclude_halfwidth_deg'),
+                pred_min=gp('calib_pred_min'),
+                pred_max=gp('calib_pred_max'),
+            )
         self.use_fp16 = self.get_parameter('use_fp16').get_parameter_value().bool_value
         self.pcl_downsample = self.get_parameter('pcl_downsample').get_parameter_value().integer_value
         num_layers = self.get_parameter('num_layers').get_parameter_value().integer_value
@@ -290,10 +316,17 @@ class DepthAnywherePCL(Node):
 
         # 各画素の視線方向に掛ける半径 [m]（従来の点群の pts = dirs * radius と同じスケール）
         if self.model_name.upper() == 'UNIFUSE' or self.model_name.upper() == 'BIFUSEV2':
-            if self.disp_alpha > 0.0:
+            alpha = beta = None
+            if self.calibrator is not None:
+                self.calibrator.update(depth_resized)
+                if self.calibrator.established:
+                    alpha, beta = self.calibrator.alpha, self.calibrator.beta
+            if alpha is None and self.disp_alpha > 0.0:
+                alpha, beta = self.disp_alpha, self.disp_beta
+            if alpha is not None:
                 # 逆距離 1/r = (pred - β)/α。遠方(分母≤0含む)は max_range に飽和させ、
                 # 穴(inf/負)を作らない
-                inv = (depth_resized - self.disp_beta) / self.disp_alpha
+                inv = (depth_resized - beta) / alpha
                 np.clip(inv, 1.0 / self.max_range, None, out=inv)
                 radius = (1.0 / inv).astype(np.float32)
             else:

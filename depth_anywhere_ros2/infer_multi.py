@@ -20,6 +20,7 @@ from cv_bridge import CvBridge
 import cv2
 import torch
 
+from depth_anywhere_ros2.affine_calib import DepthAffineCalibrator
 from depth_anywhere_ros2.infer import load_model, MEAN, STD
 from depth_anywhere_ros2.smoothing import DepthSmoother
 from depth_anywhere_ros2.utils.Projection import py360_E2C
@@ -161,10 +162,27 @@ class DepthAnywhereMulti(Node):
         # UniFuse(Depth Anywhere ckpt) の出力はスケール・シフト不定の視差
         # (pred ≈ a/r + b) なので、逆数ではなくアフィン合わせ後に逆数を取る。
         # 既定値は rosbag 実データへの最小二乗フィット (2026-07-06、カメラごと)。
+        # auto_calib 確立後はオンライン推定値が優先される（下記）。
         # 空リストを渡すと従来の scale_factor/pred にフォールバック。
         self.declare_parameter('disp_alpha',       [0.9, 0.85])
         self.declare_parameter('disp_beta',        [1.45, 1.85])
         self.declare_parameter('max_range',        10.0)
+        # 床基準のオンライン較正（tkg_tps_viewer_gl の estimate_depth_affine の移植）。
+        # カメラ床上高さ calib_cam_z をアンカーに α・β を毎フレーム推定し EMA。
+        # 確立するまでは disp_alpha/disp_beta の固定値を使う。
+        # calib_cam_x/y/yaw_deg は自機方向の除外にのみ使用（ロボット座標系、前方+x）。
+        self.declare_parameter('auto_calib',       True)
+        self.declare_parameter('calib_cam_x',      [0.339, -0.339])
+        self.declare_parameter('calib_cam_y',      [0.339, -0.339])
+        self.declare_parameter('calib_cam_z',      [0.529, 0.529])
+        self.declare_parameter('calib_cam_yaw_deg', [45.0, -135.0])
+        self.declare_parameter('calib_min_depression_deg', 20.0)
+        self.declare_parameter('calib_max_depression_deg', 60.0)
+        self.declare_parameter('calib_smoothing',  0.1)
+        self.declare_parameter('calib_exclude_halfwidth_deg', 50.0)
+        # 出力は 10·sigmoid で 0/10 付近は飽和しアフィン関係が崩れるためフィットから除外
+        self.declare_parameter('calib_pred_min',   0.3)
+        self.declare_parameter('calib_pred_max',   9.7)
         self.declare_parameter('use_fp16',         True)
         self.declare_parameter('num_layers',       18)
         self.declare_parameter('frame_skip',       1)
@@ -202,6 +220,23 @@ class DepthAnywhereMulti(Node):
         else:
             self.disp_alpha = self.disp_beta = None
         self.max_range = float(gp('max_range'))
+
+        self.calibrators = None
+        if gp('auto_calib'):
+            def per_cam(name):
+                vals = [float(v) for v in gp(name)]
+                return [vals[min(i, len(vals) - 1)] for i in range(gp('num_cameras'))]
+            cx, cy, cz, cyaw = (per_cam('calib_cam_x'), per_cam('calib_cam_y'),
+                                per_cam('calib_cam_z'), per_cam('calib_cam_yaw_deg'))
+            self.calibrators = [DepthAffineCalibrator(
+                cx[i], cy[i], cz[i], cyaw[i],
+                min_depression_deg=gp('calib_min_depression_deg'),
+                max_depression_deg=gp('calib_max_depression_deg'),
+                smoothing=gp('calib_smoothing'),
+                exclude_halfwidth_deg=gp('calib_exclude_halfwidth_deg'),
+                pred_min=gp('calib_pred_min'),
+                pred_max=gp('calib_pred_max'),
+            ) for i in range(gp('num_cameras'))]
         self.use_fp16 = gp('use_fp16')
         self.frame_skip = gp('frame_skip')
         self.pcl_downsample = gp('pcl_downsample')
@@ -254,6 +289,7 @@ class DepthAnywhereMulti(Node):
 
         self.E2C = py360_E2C(equ_h=self.H, equ_w=self.W, face_w=self.H // 2)
         self.frame_count = 0
+        self.calib_log_count = 0
 
         # 点群用: 方向ベクトル格子（入力解像度、ダウンサンプル考慮）
         ds = max(self.pcl_downsample, 1)
@@ -326,10 +362,20 @@ class DepthAnywhereMulti(Node):
                                    interpolation=cv2.INTER_LINEAR)
             depth = self.smoothers[i].apply(depth)
 
-            if self.disp_alpha is not None:
+            alpha = beta = None
+            if self.calibrators is not None:
+                self.calibrators[i].update(depth)
+                if self.calibrators[i].established:
+                    alpha = self.calibrators[i].alpha
+                    beta = self.calibrators[i].beta
+            if alpha is None and self.disp_alpha is not None:
+                alpha = self.disp_alpha[i]
+                beta = self.disp_beta[i]
+
+            if alpha is not None:
                 # 逆距離 1/r = (pred - β)/α。遠方(分母≤0含む)は max_range に飽和させ、
                 # 穴(inf/負)を作らない
-                inv = (depth - self.disp_beta[i]) / self.disp_alpha[i]
+                inv = (depth - beta) / alpha
                 np.clip(inv, 1.0 / self.max_range, None, out=inv)
                 radius = (1.0 / inv).astype(np.float32)
             else:
@@ -346,6 +392,15 @@ class DepthAnywhereMulti(Node):
 
             if self.publish_pointcloud:
                 self.publish_cloud(i, radius, imgs_input[i], header)
+
+        if self.calibrators is not None:
+            self.calib_log_count += 1
+            if self.calib_log_count % 150 == 1:  # 約10秒おき(15FPS想定)
+                state = ', '.join(
+                    f'cam{i} α={c.alpha:.3f} β={c.beta:.3f}' if c.established
+                    else f'cam{i} 未確立(固定値使用)'
+                    for i, c in enumerate(self.calibrators))
+                self.get_logger().info(f'depth affine: {state}')
 
     def publish_cloud(self, idx, radius, img_rgb, header):
         ds = max(self.pcl_downsample, 1)
