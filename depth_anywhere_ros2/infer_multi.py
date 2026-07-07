@@ -189,6 +189,10 @@ class DepthAnywhereMulti(Node):
         self.declare_parameter('tri_max_dt_ms',    40.0)   # 2画像の時刻差ゲート
         self.declare_parameter('tri_smoothing',    0.2)    # EMA係数
         self.declare_parameter('tri_min_samples',  60)
+        # 適用値のスルーレート制限（1フレームあたりの最大変化率）。較正値の更新は
+        # tickごとのステップだが、適用はフレーム単位のランプに変換して画面の
+        # 飛びをなくす。0.02 @13FPS ≈ 最大26%/秒で追従
+        self.declare_parameter('tri_slew',         0.02)
         self.declare_parameter('max_range',        10.0)   # 較正後の距離クランプ [m]
 
         gp = lambda n: self.get_parameter(n).value
@@ -256,8 +260,10 @@ class DepthAnywhereMulti(Node):
         self.tri = None
         self.tri_interval = int(gp('tri_interval'))
         self.tri_max_dt = float(gp('tri_max_dt_ms')) * 1e6  # ns
+        self.tri_slew = float(gp('tri_slew'))
         self.max_range = float(gp('max_range'))
         self.tri_tick_count = 0
+        self.tri_applied = [None] * self.num_cameras  # スルーレート制限後の適用値
         if gp('tri_calib'):
             if self.num_cameras == 2:
                 xs, ys, zs = gp('tri_cam_x'), gp('tri_cam_y'), gp('tri_cam_z')
@@ -353,16 +359,21 @@ class DepthAnywhereMulti(Node):
         # 2) バッチ推論 → (B,H,W) → 入力解像度・平滑化まで先に全カメラ分そろえる
         depth_batch = self.backend.infer(equi_np, cube_np)
         preds = []
+        preds_raw = []  # 較正用の平滑化前 pred（tick時のみ保持）
         for i in range(self.num_cameras):
             depth = depth_batch[i]
             if self.input_h != self.H or self.input_w != self.W:
                 depth = cv2.resize(depth, (self.input_w, self.input_h),
                                    interpolation=cv2.INTER_LINEAR)
+            # 較正には平滑化前を使う。時間平滑（過去フレーム混合）の遅れた pred と
+            # 瞬時の三角測量距離を対にすると、移動中に系統誤差が入るため
+            preds_raw.append(depth.copy() if tri_tick else None)
             preds.append(self.smoothers[i].apply(depth))
 
         # 3) 三角測量較正（別スレッド。処理中なら今回はスキップされる）
         if tri_tick:
-            self.tri.submit(grays_full[0], grays_full[1], preds[0], preds[1])
+            self.tri.submit(grays_full[0], grays_full[1],
+                            preds_raw[0], preds_raw[1])
         if self.tri is not None and self.tri_tick_count % 150 == 1:
             state = ', '.join(
                 f'cam{i} α={self.tri.alpha[i]:.3f} β={self.tri.beta[i]:.3f}'
@@ -377,9 +388,21 @@ class DepthAnywhereMulti(Node):
         for i in range(self.num_cameras):
             depth = preds[i]
             if self.tri is not None and self.tri.established(i):
+                # 適用値は較正値に向けてフレームあたり最大 tri_slew しか動かさない
+                # （較正のステップ更新が画面の飛びに直結しないように）
+                tgt = (self.tri.alpha[i], self.tri.beta[i])
+                if self.tri_applied[i] is None:
+                    self.tri_applied[i] = list(tgt)
+                else:
+                    for k in range(2):
+                        cur = self.tri_applied[i][k]
+                        lim = self.tri_slew * max(abs(cur), 0.2)
+                        step = min(max(tgt[k] - cur, -lim), lim)
+                        self.tri_applied[i][k] = cur + step
+                alpha, beta = self.tri_applied[i]
                 # 確立後: r = α/(pred − β) [m]。逆距離側でクランプし
                 # 遠方(分母≤0含む)は max_range 球面に飽和（穴を作らない）
-                inv = (depth - self.tri.beta[i]) / self.tri.alpha[i]
+                inv = (depth - beta) / alpha
                 np.clip(inv, 1.0 / self.max_range, None, out=inv)
                 radius = (1.0 / inv).astype(np.float32)
             else:

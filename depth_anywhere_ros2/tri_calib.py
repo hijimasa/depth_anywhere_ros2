@@ -37,6 +37,9 @@ class TriangulationCalibrator:
     R_MAX = 9.0
     MIN_X_SPREAD = 0.12   # 1/r の広がりがこれ未満なら切片が定まらないので棄却
 
+    FIT_WINDOW = 7        # tickフィットの中央値ウィンドウ（単発の外れフィットを除去）
+    GAIN_FULL_SAMPLES = 30  # このtick採用点数でゲイン最大（少ないtickは弱く反映）
+
     def __init__(self, positions, yaws_deg,
                  smoothing=0.2, min_samples=60, buffer_size=500,
                  nfeatures=1500):
@@ -58,6 +61,8 @@ class TriangulationCalibrator:
         self.alpha = [None, None]
         self.beta = [None, None]
         self.samples = [deque(maxlen=buffer_size), deque(maxlen=buffer_size)]
+        # tickごとの生フィット履歴（中央値でtick単位の外れを除去）
+        self._fits = [deque(maxlen=self.FIT_WINDOW), deque(maxlen=self.FIT_WINDOW)]
         self.stats = {'ticks': 0, 'matches': 0, 'accepted': 0}
 
         self._masks = {}   # (cam, h, w) -> セクタマスク
@@ -179,35 +184,62 @@ class TriangulationCalibrator:
                 rv = r[ok]
                 good = (np.isfinite(pv)
                         & (pv > self.PRED_MIN) & (pv < self.PRED_MAX))
-                accepted += int(good.sum())
+                n_new = int(good.sum())
+                accepted += n_new
                 for p, rr in zip(pv[good], rv[good]):
                     self.samples[cam].append((float(p), 1.0 / float(rr)))
-                self._fit(cam)
+                self._fit(cam, n_new)
             self.stats['accepted'] += accepted
 
-    def _fit(self, cam):
-        """蓄積サンプルから pred = a·(1/r) + b をロバストフィットし EMA 更新"""
-        if len(self.samples[cam]) < self.min_samples:
+    def _fit(self, cam, n_new):
+        """蓄積サンプルから pred = a·(1/r) + b をロバスト推定し EMA 更新。
+
+        最小二乗はtickごとのサンプル構成変化に敏感で、EMA後でも α が±25%
+        揺れた（2026-07-07 bag で実測。r=α/(pred−β) は遠方ほど β に過敏で
+        画面の暴れになる）。そのため多段でロバスト化する:
+          1) Theil-Sen（ペア傾きの中央値）— 単発の外れサンプルに鈍感
+          2) 直近tickフィットの中央値ウィンドウ — 単発の外れtickを丸ごと除去
+          3) 採用点数に応じた適応ゲイン — 貧弱なtickは弱くしか反映しない
+        """
+        if len(self.samples[cam]) < self.min_samples or n_new <= 0:
             return
         arr = np.array(self.samples[cam])
         y, x = arr[:, 0], arr[:, 1]
         if x.max() - x.min() < self.MIN_X_SPREAD:
             return  # 距離の多様性不足。切片が定まらない
-        a = b = None
-        for _ in range(3):
-            A = np.stack([x, np.ones_like(x)], axis=1)
-            sol, *_ = np.linalg.lstsq(A, y, rcond=None)
-            a, b = float(sol[0]), float(sol[1])
-            res = np.abs(y - (a * x + b))
-            keep = res < max(2.0 * float(np.median(res)), 0.05)
-            if keep.sum() < self.min_samples // 2:
-                break
-            x, y = x[keep], y[keep]
-        if a is None or not (a > 0.05) or not math.isfinite(b):
+        # 固定グリッド（1/r 空間）ビンの中央値に直線を当てる。ビン位置が
+        # データによらず固定なので、tickごとのサンプル構成変化に鈍感。
+        # 各ビン中央値は外れ値に頑強で、Theil-Sen のような減衰バイアスもない
+        edges = np.linspace(1.0 / self.R_MAX, 1.0 / self.R_MIN, 21)
+        bi = np.digitize(x, edges) - 1
+        xs, ys, ws = [], [], []
+        for k in range(len(edges) - 1):
+            sel = bi == k
+            if sel.sum() < 6:
+                continue
+            xs.append(float(np.median(x[sel])))
+            ys.append(float(np.median(y[sel])))
+            ws.append(float(sel.sum()))
+        if len(xs) < 3 or max(xs) - min(xs) < self.MIN_X_SPREAD:
             return
+        xs = np.array(xs)
+        ys = np.array(ys)
+        ws = np.sqrt(np.array(ws))  # 点数の平方根で重み付け
+        A = np.stack([xs, np.ones_like(xs)], axis=1) * ws[:, None]
+        sol, *_ = np.linalg.lstsq(A, ys * ws, rcond=None)
+        a, b = float(sol[0]), float(sol[1])
+        if not (a > 0.05) or not math.isfinite(b):
+            return
+        self._fits[cam].append((a, b))
+        fits = np.array(self._fits[cam])
+        a_t = float(np.median(fits[:, 0]))
+        b_t = float(np.median(fits[:, 1]))
         if self.alpha[cam] is None:
-            self.alpha[cam] = a
-            self.beta[cam] = b
+            # 初期の不安定なフィットで確定しないよう、ウィンドウが溜まってから確立
+            if len(self._fits[cam]) >= 3:
+                self.alpha[cam] = a_t
+                self.beta[cam] = b_t
         else:
-            self.alpha[cam] += (a - self.alpha[cam]) * self.smoothing
-            self.beta[cam] += (b - self.beta[cam]) * self.smoothing
+            gain = self.smoothing * min(1.0, n_new / self.GAIN_FULL_SAMPLES)
+            self.alpha[cam] += (a_t - self.alpha[cam]) * gain
+            self.beta[cam] += (b_t - self.beta[cam]) * gain
