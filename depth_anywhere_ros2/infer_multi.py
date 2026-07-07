@@ -22,6 +22,7 @@ import torch
 
 from depth_anywhere_ros2.infer import load_model, MEAN, STD
 from depth_anywhere_ros2.smoothing import DepthSmoother
+from depth_anywhere_ros2.tri_calib import TriangulationCalibrator
 from depth_anywhere_ros2.utils.Projection import py360_E2C
 
 MEAN_ARR = np.array(MEAN, dtype=np.float32)
@@ -174,6 +175,21 @@ class DepthAnywhereMulti(Node):
         self.declare_parameter('plane_threshold', 0.02)
         self.declare_parameter('temporal_smooth_alpha', 0.0)
         self.declare_parameter('temporal_smooth_frames', 5)
+        # 三角測量オンライン較正（2カメラ専用）:
+        # 共通視野の特徴を既知基線で三角測量し、距離変換 r = α/(pred − β) の
+        # α,β を推定する。確立後は scale_factor/pred に代わり メートル値を配信。
+        # ※確立後の出力はメートルなので tkg_tps_viewer_gl 側の depth_scale.auto
+        #   は false にすること（二重補正防止）。
+        self.declare_parameter('tri_calib',        False)
+        self.declare_parameter('tri_cam_x',        [0.339, -0.339])   # yaml と同値
+        self.declare_parameter('tri_cam_y',        [0.339, -0.339])
+        self.declare_parameter('tri_cam_z',        [0.529, 0.529])
+        self.declare_parameter('tri_cam_yaw_deg',  [45.0, -135.0])    # +90°規約は内部で適用
+        self.declare_parameter('tri_interval',     15)     # 何フレームおきに較正するか
+        self.declare_parameter('tri_max_dt_ms',    40.0)   # 2画像の時刻差ゲート
+        self.declare_parameter('tri_smoothing',    0.2)    # EMA係数
+        self.declare_parameter('tri_min_samples',  60)
+        self.declare_parameter('max_range',        10.0)   # 較正後の距離クランプ [m]
 
         gp = lambda n: self.get_parameter(n).value
         self.num_cameras = gp('num_cameras')
@@ -236,6 +252,27 @@ class DepthAnywhereMulti(Node):
         self.E2C = py360_E2C(equ_h=self.H, equ_w=self.W, face_w=self.H // 2)
         self.frame_count = 0
 
+        # 三角測量較正（2カメラ時のみ）
+        self.tri = None
+        self.tri_interval = int(gp('tri_interval'))
+        self.tri_max_dt = float(gp('tri_max_dt_ms')) * 1e6  # ns
+        self.max_range = float(gp('max_range'))
+        self.tri_tick_count = 0
+        if gp('tri_calib'):
+            if self.num_cameras == 2:
+                xs, ys, zs = gp('tri_cam_x'), gp('tri_cam_y'), gp('tri_cam_z')
+                yaws = gp('tri_cam_yaw_deg')
+                self.tri = TriangulationCalibrator(
+                    positions=[(xs[i], ys[i], zs[i]) for i in range(2)],
+                    yaws_deg=[float(y) for y in yaws],
+                    smoothing=gp('tri_smoothing'),
+                    min_samples=int(gp('tri_min_samples')),
+                )
+                self.get_logger().info('三角測量較正 有効（確立後はメートル出力。'
+                                       'ビューワの depth_scale.auto は無効にすること）')
+            else:
+                self.get_logger().warning('tri_calib は2カメラ専用のため無効化')
+
         # 点群用: 方向ベクトル格子（入力解像度、ダウンサンプル考慮）
         ds = max(self.pcl_downsample, 1)
         h_ds = self.input_h // ds
@@ -276,14 +313,32 @@ class DepthAnywhereMulti(Node):
 
         self.process()
 
+    def tri_tick_due(self):
+        """三角測量較正を今フレーム実行するか（レート制限 + 2画像の時刻差ゲート）"""
+        if self.tri is None:
+            return False
+        self.tri_tick_count += 1
+        if self.tri_tick_count % self.tri_interval != 0:
+            return False
+        s0 = self.latest_msgs[0].header.stamp
+        s1 = self.latest_msgs[1].header.stamp
+        dt = abs((s0.sec - s1.sec) * 1_000_000_000 + (s0.nanosec - s1.nanosec))
+        return dt <= self.tri_max_dt
+
     def process(self):
+        tri_tick = self.tri_tick_due()
+
         # 1) 前処理: 入力解像度リサイズ → モデル解像度 → 正規化バッチ + cube ストリップ
         imgs_input = []
         equi_imgs = []
         cube_imgs = []
+        grays_full = []   # 較正tick時のみ: 元解像度グレースケール（特徴検出用）
         for m in self.latest_msgs:
-            img = self.br.imgmsg_to_cv2(m, desired_encoding='rgb8')
-            img = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
+            img_orig = self.br.imgmsg_to_cv2(m, desired_encoding='rgb8')
+            if tri_tick:
+                grays_full.append(cv2.cvtColor(img_orig, cv2.COLOR_RGB2GRAY))
+            img = cv2.resize(img_orig, (self.input_w, self.input_h),
+                             interpolation=cv2.INTER_LINEAR)
             imgs_input.append(img)
             if self.input_h != self.H or self.input_w != self.W:
                 img_model = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_LINEAR)
@@ -295,19 +350,41 @@ class DepthAnywhereMulti(Node):
         equi_np = normalize_batch(equi_imgs)
         cube_np = normalize_batch(cube_imgs)
 
-        # 2) バッチ推論 → (B,H,W)
+        # 2) バッチ推論 → (B,H,W) → 入力解像度・平滑化まで先に全カメラ分そろえる
         depth_batch = self.backend.infer(equi_np, cube_np)
-
-        # 3) カメラごとに後処理・パブリッシュ
-        stamp = self.get_clock().now().to_msg()
+        preds = []
         for i in range(self.num_cameras):
             depth = depth_batch[i]
             if self.input_h != self.H or self.input_w != self.W:
                 depth = cv2.resize(depth, (self.input_w, self.input_h),
                                    interpolation=cv2.INTER_LINEAR)
-            depth = self.smoothers[i].apply(depth)
+            preds.append(self.smoothers[i].apply(depth))
 
-            radius = (self.scale_factor / (depth + 1e-6)).astype(np.float32)
+        # 3) 三角測量較正（別スレッド。処理中なら今回はスキップされる）
+        if tri_tick:
+            self.tri.submit(grays_full[0], grays_full[1], preds[0], preds[1])
+        if self.tri is not None and self.tri_tick_count % 150 == 1:
+            state = ', '.join(
+                f'cam{i} α={self.tri.alpha[i]:.3f} β={self.tri.beta[i]:.3f}'
+                if self.tri.established(i) else f'cam{i} 未確立'
+                for i in range(2))
+            s = self.tri.stats
+            self.get_logger().info(
+                f"tri calib: {state} (tick={s['ticks']} 採用点={s['accepted']})")
+
+        # 4) カメラごとに距離変換・パブリッシュ
+        stamp = self.get_clock().now().to_msg()
+        for i in range(self.num_cameras):
+            depth = preds[i]
+            if self.tri is not None and self.tri.established(i):
+                # 確立後: r = α/(pred − β) [m]。逆距離側でクランプし
+                # 遠方(分母≤0含む)は max_range 球面に飽和（穴を作らない）
+                inv = (depth - self.tri.beta[i]) / self.tri.alpha[i]
+                np.clip(inv, 1.0 / self.max_range, None, out=inv)
+                radius = (1.0 / inv).astype(np.float32)
+            else:
+                # 従来出力（スケール任意）。ビューワ側の較正が前提
+                radius = (self.scale_factor / (depth + 1e-6)).astype(np.float32)
 
             header = self.latest_msgs[i].header
             header.frame_id = 'camera_link'
